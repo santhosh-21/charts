@@ -2,11 +2,14 @@
 
 namespace Drupal\charts\Plugin\views\style;
 
-use Drupal\charts\Plugin\chart\Library\ChartInterface;
 use Drupal\charts\ChartManager;
+use Drupal\charts\ChartViewsFieldInterface;
+use Drupal\charts\Element\BaseSettings;
+use Drupal\charts\Plugin\chart\Library\ChartInterface;
 use Drupal\charts\TypeManager;
 use Drupal\Component\Serialization\Json;
 use Drupal\Component\Utility\Html;
+use Drupal\Component\Utility\Xss;
 use Drupal\Core\Config\ConfigFactoryInterface;
 use Drupal\Core\Form\FormStateInterface;
 use Drupal\Core\Plugin\ContainerFactoryPluginInterface;
@@ -33,25 +36,21 @@ use Symfony\Component\DependencyInjection\ContainerInterface;
 class ChartsPluginStyleChart extends StylePluginBase implements ContainerFactoryPluginInterface {
 
   /**
+   * {@inheritdoc}
+   */
+  protected $usesFields = TRUE;
+
+  /**
+   * {@inheritdoc}
+   */
+  protected $usesRowPlugin = TRUE;
+
+  /**
    * The config factory service.
    *
    * @var \Drupal\Core\Config\ConfigFactoryInterface
    */
   protected ConfigFactoryInterface $configFactory;
-
-  /**
-   * Fields.
-   *
-   * @var \Drupal\views\Plugin\views\style\StylePluginBase
-   */
-  protected $usesFields = TRUE;
-
-  /**
-   * RowPlugin.
-   *
-   * @var \Drupal\views\Plugin\views\style\StylePluginBase
-   */
-  protected $usesRowPlugin = TRUE;
 
   /**
    * The chart manager service.
@@ -139,7 +138,9 @@ class ChartsPluginStyleChart extends StylePluginBase implements ContainerFactory
     // @todo ensure that chart extensions inherit defaults from parent
     // Remove the default setting for chart type so it can be inherited if this
     // is a chart extension type.
-    if ($this->view->style_plugin === 'chart_extension') {
+    $style_plugin = $this->view->style_plugin ?? NULL;
+    $style_plugin_id = $style_plugin ? $style_plugin->getPluginId() : '';
+    if ($style_plugin_id === 'chart_extension') {
       $options['chart_settings']['default']['type'] = NULL;
     }
     $options['path'] = ['default' => 'charts'];
@@ -155,7 +156,7 @@ class ChartsPluginStyleChart extends StylePluginBase implements ContainerFactory
 
     $handlers = $this->displayHandler->getHandlers('field');
     if (empty($handlers)) {
-      $form['error_markup'] = ['#markup' => '<div class="error messages">' . $this->t('You need at least one field before you can configure your table settings') . '</div>'];
+      $form['error_markup'] = ['#markup' => '<div class="error messages">' . $this->t('You need at least one field before you can configure your chart settings') . '</div>'];
       return;
     }
 
@@ -173,7 +174,7 @@ class ChartsPluginStyleChart extends StylePluginBase implements ContainerFactory
       // the field is an entity reference.
       $form['grouping'][0]['field']['#ajax'] = [
         'wrapper' => $settings_wrapper,
-        'callback' => [get_called_class(), 'groupingChartSettingsAjaxCallback'],
+        'callback' => [static::class, 'groupingChartSettingsAjaxCallback'],
       ];
     }
     if (isset($form['grouping'][1])) {
@@ -198,10 +199,55 @@ class ChartsPluginStyleChart extends StylePluginBase implements ContainerFactory
   /**
    * {@inheritdoc}
    */
+  public function validateOptionsForm(&$form, FormStateInterface $form_state) {
+    parent::validateOptionsForm($form, $form_state);
+
+    if (!$form_state->hasValue(['style_options', 'chart_settings'])) {
+      return;
+    }
+
+    $chart_settings = $form_state->getValue(['style_options', 'chart_settings']);
+    $selected_library_id = $chart_settings['library'] ?? '';
+    if (empty($chart_settings['library'])) {
+      $form_state->setError($form['chart_settings'], $this->t('Please select a valid charting library or <a href="/admin/modules">install</a> at least one module that implements a chart library plugin.'));
+      return;
+    }
+    if (($selected_library_id === 'site_default' && !BaseSettings::getConfiguredSiteDefaultLibraryId()) || empty($chart_settings['type'])) {
+      $destination = '/admin/structure/views/view/' . $this->view->storage->id();
+      if ($this->view->current_display) {
+        $destination .= '/' . $this->view->current_display;
+      }
+      $form_state->setError($form['chart_settings'], $this->t('The site default charting library has not been set yet, or it does not support chart type options. Please ensure that you have correctly <a href="@url">configured the chart module</a>.', [
+        '@url' => '/admin/config/content/charts?destination=' . $destination,
+      ]));
+    }
+  }
+
+  /**
+   * {@inheritdoc}
+   */
   public function validate() {
     $errors = parent::validate();
     $chart_settings = $this->options['chart_settings'];
-    $selected_data_fields = !empty($chart_settings['fields']['data_providers']) && is_array($chart_settings['fields']['data_providers']) ? $this->getSelectedDataFields($chart_settings['fields']['data_providers']) : NULL;
+    $selected_library_id = $chart_settings['library'] ?? '';
+    if (!$selected_library_id) {
+      $errors[] = $this->t('Please select a valid charting library.');
+      return $errors;
+    }
+
+    if ($selected_library_id === 'site_default' && !BaseSettings::getConfiguredSiteDefaultLibraryId()) {
+      $destination = '/admin/structure/views/view/' . $this->view->storage->id();
+      if ($this->view->current_display) {
+        $destination .= '/' . $this->view->current_display;
+      }
+      $errors[] = $this->t('The site default charting library has not been set yet, or it does not support chart type options. Please ensure that you have correctly <a href="@url">configured the chart module</a>.', [
+        '@url' => '/admin/config/content/charts?destination=' . $destination,
+      ]);
+      return $errors;
+    }
+
+    $selected_data_fields = !empty($chart_settings['fields']['data_providers']) && is_array($chart_settings['fields']['data_providers']) ?
+      $this->getSelectedDataFields($chart_settings['fields']['data_providers']) : NULL;
 
     // Avoid calling validation before arriving at the view edit page.
     if ($this->routeMatch->getRouteName() != 'views_ui.add' && empty($selected_data_fields)) {
@@ -236,11 +282,30 @@ class ChartsPluginStyleChart extends StylePluginBase implements ContainerFactory
       return $field_id !== $label_field_key && in_array($field_id, $field_keys);
     });
 
-    // Allow argument tokens in the title.
     $title = !empty($chart_settings['display']['title']) ? $chart_settings['display']['title'] : '';
-    if (!empty($this->view->build_info['substitutions'])) {
-      $tokens = $this->view->build_info['substitutions'];
-      $title = $this->viewsTokenReplace($title, $tokens);
+    $subtitle = !empty($chart_settings['display']['subtitle']) ? $chart_settings['display']['subtitle'] : '';
+    if (!empty($title) || !empty($subtitle)) {
+      $tokens = [];
+      $global_tokens = [];
+      foreach ($field_handlers as $field_id => $field_handler) {
+        // This needs to run or else the values are empty.
+        $this->getField(0, $field_id);
+        // If the row index is not set, set it to 0.
+        if (!isset($this->view->row_index)) {
+          $this->view->row_index = 0;
+        }
+        $render_tokens = $this->view->field[$field_id]->getRenderTokens([]) ?? [];
+        $global_tokens = array_merge($render_tokens, $global_tokens);
+      }
+      foreach ($global_tokens as $key => $value) {
+        $tokens[$key] = Xss::filterAdmin($this->tokenizeValue($key, 0));
+      }
+      if (!empty($tokens)) {
+        // Allow argument tokens in the title.
+        $title = $this->viewsTokenReplace($title, $tokens);
+        // Allow argument tokens in the subtitle.
+        $subtitle = $this->viewsTokenReplace($subtitle, $tokens);
+      }
     }
 
     // To be used with the exposed chart type field.
@@ -256,12 +321,12 @@ class ChartsPluginStyleChart extends StylePluginBase implements ContainerFactory
       '#chart_id' => $chart_id,
       '#id' => Html::getUniqueId('chart_' . $chart_id),
       '#stacking' => $chart_settings['fields']['stacking'] ?? '0',
-      '#color_changer' => $chart_settings['fields']['color_changer'] ?? FALSE,
       '#polar' => $chart_settings['display']['polar'],
       '#three_dimensional' => $chart_settings['display']['three_dimensional'],
       '#gauge' => $chart_settings['display']['gauge'],
       '#title' => $title,
       '#title_position' => $chart_settings['display']['title_position'],
+      '#subtitle' => $subtitle,
       '#tooltips' => $chart_settings['display']['tooltips'],
       '#data_labels' => $chart_settings['display']['data_labels'],
       '#data_markers' => $chart_settings['display']['data_markers'],
@@ -274,6 +339,7 @@ class ChartsPluginStyleChart extends StylePluginBase implements ContainerFactory
       '#height' => $chart_settings['display']['dimensions']['height'],
       '#width_units' => $chart_settings['display']['dimensions']['width_units'],
       '#height_units' => $chart_settings['display']['dimensions']['height_units'],
+      '#color_changer' => $chart_settings['display']['color_changer'] ?? FALSE,
       '#attributes' => ['data-drupal-selector-chart' => Html::getId($chart_id)],
       // Pass info about the actual view results to allow further processing.
       '#view' => $this->view,
@@ -286,11 +352,14 @@ class ChartsPluginStyleChart extends StylePluginBase implements ContainerFactory
       $data = [];
       $this->renderFields($this->view->result);
       $renders = $this->rendered_fields;
-      if (!$label_field_key && count($renders) === 1 && count($data_fields) > 1) {
+      if (!$label_field_key && count($data_fields) > 1) {
         foreach ($data_fields as $field_id => $row) {
           $data_row = [];
           if (!empty($row['label'])) {
             $data_row['name'] = strip_tags($row['label'], ENT_QUOTES);
+          }
+          else {
+            $data_row['name'] = strip_tags($field_id, ENT_QUOTES);
           }
           if (!empty($chart_fields['data_providers'][$field_id]['color'])) {
             $data_row['color'] = $chart_fields['data_providers'][$field_id]['color'];
@@ -320,6 +389,7 @@ class ChartsPluginStyleChart extends StylePluginBase implements ContainerFactory
         '#data' => $data,
         '#title' => $data_field['label'],
         '#color' => isset($chart_fields['data_providers'][$data_field_key]) ? $chart_fields['data_providers'][$data_field_key]['color'] : '',
+        '#grouping_colors' => $this->extractGroupingColorsForSingleAxisChartType($data),
       ];
     }
     else {
@@ -362,7 +432,7 @@ class ChartsPluginStyleChart extends StylePluginBase implements ContainerFactory
           // from before the grouping, so we need to keep our own row number
           // when looping through the rows.
           foreach ($data_set['rows'] as $result_number => $row) {
-            $xaxis_label = trim(strip_tags((string)$this->getField($result_number, $label_field_key)));
+            $xaxis_label = trim(strip_tags((string) $this->getField($result_number, $label_field_key)));
             if ($label_field_key) {
               $xaxis_labels = $chart['xaxis']['#labels'] ?? [];
               if (!in_array($xaxis_label, $xaxis_labels)) {
@@ -565,8 +635,8 @@ class ChartsPluginStyleChart extends StylePluginBase implements ContainerFactory
   public function calculateDependencies() {
     $dependencies = [];
 
-    if (!empty($this->options['library'])) {
-      $plugin_definition = $this->chartManager->getDefinition($this->options['library']);
+    if (!empty($this->options['chart_settings']['library'])) {
+      $plugin_definition = $this->chartManager->getDefinition($this->options['chart_settings']['library']);
       $dependencies['module'] = [$plugin_definition['provider']];
     }
 
@@ -594,10 +664,13 @@ class ChartsPluginStyleChart extends StylePluginBase implements ContainerFactory
 
     $value = trim(strip_tags($value));
 
-    if (strpos($field, 'field_charts_fields_scatter') === 0 || strpos($field, 'field_charts_fields_bubble') === 0) {
-
+    // Get the field plugin class to determine if a Charts-specific field
+    // is being used.
+    $field_plugin = $this->view->field[$field];
+    if ($field_plugin instanceof ChartViewsFieldInterface && $field_plugin->getChartFieldDataType() === 'array') {
       return Json::decode($value);
     }
+
     // Convert empty strings to NULL.
     if ($value === '' || is_null($value)) {
       $value = NULL;
@@ -811,6 +884,43 @@ class ChartsPluginStyleChart extends StylePluginBase implements ContainerFactory
     }
 
     return $processed_data;
+  }
+
+  /**
+   * Returns the grouping colors for single axis chart type.
+   *
+   * @param array $data
+   *   The data.
+   *
+   * @return array
+   *   The grouping colors.
+   */
+  private function extractGroupingColorsForSingleAxisChartType(array $data): array {
+    if (empty($this->options['grouping'][0]['field'])) {
+      return [];
+    }
+
+    $grouping_colors = [];
+    $grouping_field = $this->options['grouping'][0]['field'];
+    $chart_settings = $this->options['chart_settings'];
+    $color_selection_method = $chart_settings['fields']['entity_grouping']['color_selection_method'] ?? '';
+    $grouping_entity_field = $this->view->field[$grouping_field];
+    $group_field_name = $grouping_entity_field ? ($grouping_entity_field->definition['field_name'] ?? '') : '';
+    foreach ($data as $index => $set) {
+      $row = $this->view->result[$index];
+      if ($color_selection_method && $group_field_name && $grouping_entity_field instanceof EntityField && $row instanceof ResultRow) {
+        switch ($color_selection_method) {
+          case 'by_entities_on_entity_reference':
+            $grouping_colors[$index][$set[0]] = $this->extractGroupedSelectedColorByEntity($grouping_entity_field, $row, $group_field_name);
+            break;
+
+          case 'by_field_on_referenced_entity':
+            $grouping_colors[$index][$set[0]] = $this->extractGroupedSelectedColorOnReferencedEntityField($grouping_entity_field, $row, $group_field_name);
+            break;
+        }
+      }
+    }
+    return $grouping_colors;
   }
 
 }

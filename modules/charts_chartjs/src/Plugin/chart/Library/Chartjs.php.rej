@@ -1,0 +1,18 @@
+--- modules/charts_chartjs/src/Plugin/chart/Library/Chartjs.php
++++ modules/charts_chartjs/src/Plugin/chart/Library/Chartjs.php
+@@ -365,15 +365,6 @@ private function populateCategories(array $element, array $chart_definition) {
+       if ($type === 'chart_xaxis' && isset($element[$child]['#labels'])) {
+         $categories = is_array($element[$child]['#labels']) ? array_map('strip_tags', $element[$child]['#labels']) : [];
+       }
+-      if (in_array($element['#chart_type'], $this->getPieStyleTypes())
+-        && $type !== 'chart_xaxis') {
+-        if ($element[$child]['#type'] === 'chart_data') {
+-          // Get the first item in each array inside $element[$child]['#data'].
+-          $categories = array_map(function ($item) {
+-            return $item;
+-          }, $element[$child]['#data']);
+-        }
+-      }
+       // Merge in axis raw options.
+       if (!empty($element[$child]['#raw_options'])) {
+         $categories = NestedArray::mergeDeepArray([

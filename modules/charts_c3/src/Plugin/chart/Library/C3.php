@@ -17,7 +17,19 @@ use Symfony\Component\DependencyInjection\ContainerInterface;
  *
  * @Chart(
  *   id = "c3",
- *   name = @Translation("C3")
+ *   name = @Translation("C3"),
+ *   types = {
+ *     "area",
+ *     "bar",
+ *     "bubble",
+ *     "column",
+ *     "donut",
+ *     "gauge",
+ *     "line",
+ *     "pie",
+ *     "scatter",
+ *     "spline",
+ *   },
  * )
  */
 class C3 extends ChartBase implements ContainerFactoryPluginInterface {
@@ -84,7 +96,7 @@ class C3 extends ChartBase implements ContainerFactoryPluginInterface {
     $chart_definition = $this->populateAxes($element, $chart_definition);
 
     if (!empty($element['#height']) || !empty($element['#width'])) {
-      $element['#attributes']['style'] = 'height:' . $element['#height'] . $element['#height_units'] . ';width:' . $element['#width'] . $element['#width_units'].  ';';
+      $element['#attributes']['style'] = 'height:' . $element['#height'] . $element['#height_units'] . ';width:' . $element['#width'] . $element['#width_units'] . ';';
     }
 
     if (!isset($element['#id'])) {
@@ -181,7 +193,11 @@ class C3 extends ChartBase implements ContainerFactoryPluginInterface {
    */
   private function populateOptions(array $element, array $chart_definition) {
     $type = $this->getType($element['#chart_type']);
-    $chart_definition['title']['text'] = $element['#title'] ?? '';
+    $title = $element['#title'] ?? '';
+    if (!empty($element['#subtitle'])) {
+      $title .= ': ' . $element['#subtitle'];
+    }
+    $chart_definition['title']['text'] = $title;
     $chart_definition['legend']['show'] = !empty($element['#legend_position']);
     if (!in_array($type, ['scatter', 'bubble'])) {
       $chart_definition['axis']['x']['type'] = 'category';
@@ -250,9 +266,9 @@ class C3 extends ChartBase implements ContainerFactoryPluginInterface {
     foreach ($children as $child) {
       $type = $element[$child]['#type'];
       if ($type === 'chart_xaxis') {
-        $x_axis_key = $child;
+        $chart_definition['axis']['x']['label'] = $element[$child]['#title'] ?? '';
         $chart_type = $this->getType($element['#chart_type']);
-        $categories = $element[$x_axis_key]['#labels'] ? array_map('strip_tags', $element[$x_axis_key]['#labels']) : [];
+        $categories = $this->stripLabelTags($element[$child]['#labels']);
         if (!in_array($chart_type, ['pie', 'donut'])) {
           if ($chart_type === 'scatter' || $chart_type === 'bubble') {
             // Scatter is not supported: https://github.com/c3js/c3/issues/1902
@@ -272,14 +288,37 @@ class C3 extends ChartBase implements ContainerFactoryPluginInterface {
         }
       }
       if ($type === 'chart_yaxis') {
-        $y_axis_key = $child;
-        if (!empty($element[$y_axis_key]['#opposite']) && $element[$y_axis_key]['#opposite'] === TRUE) {
+        if (!empty($element[$child]['#opposite']) && $element[$child]['#opposite'] === TRUE) {
           $chart_definition['axis']['y2']['show'] = TRUE;
+          $this->setLabelMinMax($chart_definition, 'y2', $element[$child]);
+        }
+        else {
+          $this->setLabelMinMax($chart_definition, 'y', $element[$child]);
         }
       }
     }
 
     return $chart_definition;
+  }
+
+  /**
+   * Set the label, min, and max.
+   *
+   * @param array $chart_definition
+   *   The chart definition.
+   * @param string $axis
+   *   The axis.
+   * @param array $element
+   *   The element.
+   */
+  private function setLabelMinMax(array &$chart_definition, string $axis, array $element): void {
+    $chart_definition['axis'][$axis]['label'] = $element['#title'] ?? '';
+    if (!empty($element['#min'])) {
+      $chart_definition['axis'][$axis]['min'] = $element['#min'];
+    }
+    if (!empty($element['#max'])) {
+      $chart_definition['axis'][$axis]['max'] = $element['#max'];
+    }
   }
 
   /**
@@ -321,7 +360,7 @@ class C3 extends ChartBase implements ContainerFactoryPluginInterface {
         $chart_definition['color']['pattern'][] = $child_element['#color'];
       }
       if (!in_array($type, ['pie', 'donut'])) {
-        $series_title = strip_tags($child_element['#title']);
+        $series_title = isset($child_element['#title']) ? strip_tags($child_element['#title']) : '';
         $types[$series_title] = $child_element['#chart_type'] ? $this->getType($child_element['#chart_type']) : $type;
         if (!in_array($type, ['scatter', 'bubble'])) {
           $columns[$columns_key_start][] = $series_title;
@@ -330,10 +369,12 @@ class C3 extends ChartBase implements ContainerFactoryPluginInterface {
               if ($type === 'gauge') {
                 array_shift($datum);
               }
-              $columns[$columns_key_start][] = array_map('strip_tags', $datum);
+              $columns[$columns_key_start][] = array_map(function ($item) {
+                return isset($item) ? strip_tags($item) : NULL;
+              }, $datum);
             }
             else {
-              $columns[$columns_key_start][] = strip_tags($datum);
+              $columns[$columns_key_start][] = isset($datum) ? strip_tags($datum) : NULL;
             }
           }
         }
@@ -353,8 +394,19 @@ class C3 extends ChartBase implements ContainerFactoryPluginInterface {
         }
       }
       else {
-        foreach ($child_element['#data'] as $datum) {
+        foreach ($child_element['#data'] as $datum_index => $datum) {
+          if (!empty($datum['color'])) {
+            $chart_definition['color']['pattern'][$datum_index] = $datum['color'];
+            unset($datum['color']);
+            $datum = array_values($datum);
+          }
           $columns[] = $datum;
+        }
+
+        // Add colors for each segment.
+        foreach ($child_element['#grouping_colors'] ?? [] as $key => $colors_array) {
+          $color = reset($colors_array);
+          $chart_definition['color']['pattern'][$key] = $color;
         }
       }
 
@@ -376,6 +428,27 @@ class C3 extends ChartBase implements ContainerFactoryPluginInterface {
     }
 
     return $chart_definition;
+  }
+
+  /**
+   * Strip tags from each item in an array.
+   *
+   * @param array $items
+   *   The array.
+   *
+   * @return array
+   *   Return the cleaned array.
+   */
+  private function stripLabelTags(array $items): array {
+    if (empty($items)) {
+      return [];
+    }
+    $categories = [];
+    foreach ($items as $item) {
+      $categories[] = isset($item) ? strip_tags($item) : NULL;
+    }
+
+    return $categories;
   }
 
 }

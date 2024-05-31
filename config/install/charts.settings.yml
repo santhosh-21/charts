@@ -1,8 +1,10 @@
+dependencies: []
 charts_default_settings:
   library: ''
   type: line
   display:
     title: ''
+    subtitle: ''
     colors:
       - '#006fb0'
       - '#f07c33'
